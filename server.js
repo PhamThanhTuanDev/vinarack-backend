@@ -17,7 +17,7 @@ const sizeOf = (path) => {
         if (sizeOfLib && typeof sizeOfLib.default === 'function') return sizeOfLib.default(path);
         return { width: 0, height: 0 };
     } catch (e) {
-        console.error("Warning: Không lấy được kích thước ảnh:", e.message);
+        // console.error("Warning: Không lấy được kích thước ảnh:", e.message);
         return { width: 0, height: 0 }; // Trả về 0 thay vì throw lỗi
     }
 };
@@ -182,10 +182,8 @@ app.delete('/api/media/:id', async (req, res) => {
             // Lệnh này sẽ xóa cả thumbnail và gallery của sản phẩm nếu dùng ảnh này
             await connection.query('DELETE FROM product_images WHERE image_url = ?', [fileUrl]);
 
-            // 4. Kiểm tra xem bảng products có cột 'thumbnail' không thì mới update
-            // (Nếu bạn chưa thêm cột này vào bảng products thì bỏ qua lệnh này để tránh lỗi)
-            // Tạm thời comment lại để an toàn, vì dữ liệu ảnh chính nằm ở product_images
-            // await connection.query('UPDATE products SET thumbnail = "" WHERE thumbnail = ?', [fileUrl]);
+            // 4. Xóa liên kết trong bảng project_images (Dự án) - MỚI THÊM
+             await connection.query('DELETE FROM project_images WHERE image_url = ?', [fileUrl]);
 
             // 5. Xóa liên kết trong bài viết Tin tức (bảng news)
             // Kiểm tra bảng news có cột thumbnail_url không (theo thiết kế là có)
@@ -247,6 +245,32 @@ app.get('/api/products/:slug', async (req, res) => {
     }
 });
 
+// Lấy chi tiết dự án theo Slug (Public)
+// [ĐÃ SỬA] Thêm phần lấy Gallery ảnh từ project_images
+app.get('/api/projects/:slug', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM projects WHERE slug = ?', [req.params.slug]);
+        if (rows.length === 0) return res.status(404).json({ message: 'Dự án không tồn tại' });
+        
+        const project = rows[0]; // Sửa tên biến cho nhất quán
+
+        // Parse JSON thông số kỹ thuật
+        if (typeof project.technical_specs === 'string') {
+            try { project.technical_specs = JSON.parse(project.technical_specs); } catch (e) { project.technical_specs = {}; }
+        }
+
+        // Lấy Thumbnail (từ bảng project_images)
+        const [thumbnails] = await pool.query('SELECT image_url FROM project_images WHERE project_id = ? AND is_thumbnail = 1 LIMIT 1', [project.id]);
+        project.thumbnail_url = thumbnails.length > 0 ? thumbnails[0].image_url : '';
+
+        // Lấy Gallery (Album ảnh) - PHẦN QUAN TRỌNG BẠN ĐANG THIẾU
+        const [images] = await pool.query('SELECT image_url FROM project_images WHERE project_id = ? AND is_thumbnail = 0 ORDER BY sort_order', [project.id]);
+        project.images = images.map(img => img.image_url);
+
+        res.json(project);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // 2. API Tin Tức
 app.get('/api/news', async (req, res) => {
     try {
@@ -272,6 +296,14 @@ app.get('/api/jobs', async (req, res) => {
     try {
         const [rows] = await pool.query('SELECT * FROM jobs WHERE status = "open" ORDER BY created_at DESC');
         res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/jobs/:slug', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM jobs WHERE slug = ?', [req.params.slug]);
+        if (rows.length > 0) res.json(rows[0]);
+        else res.status(404).json({ message: 'Tin tuyển dụng không tồn tại' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -450,13 +482,13 @@ app.post('/api/admin/news', async (req, res) => {
 
 // Sửa tin tức
 app.put('/api/admin/news/:id', async (req, res) => {
-    const { title, category, summary, content, thumbnail_url, status } = req.body;
+    const { title, category, summary, content, thumbnail_url, status, slug } = req.body;
     // Nếu đổi tiêu đề thì update slug, không thì giữ nguyên (hoặc update luôn cũng được)
-    const slug = createSlug(title); 
+    const finalSlug = slug ? slug : createSlug(title);
     try {
         await pool.query(
             'UPDATE news SET title=?, slug=?, category=?, summary=?, content=?, thumbnail_url=?, status=? WHERE id=?',
-            [title, slug, category, summary, content, thumbnail_url, status, req.params.id]
+            [title, finalSlug, category, summary, content, thumbnail_url, status, req.params.id]
         );
         res.json({ message: 'Cập nhật tin tức thành công' });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -589,53 +621,139 @@ app.put('/api/admin/contacts/:id', async (req, res) => {
 
 // 8. Quản lý Dự Án (ADMIN)
 
-// Lấy danh sách dự án
+// Lấy danh sách dự án (Admin & Public) - Kèm thumbnail
 app.get('/api/admin/projects', async (req, res) => {
     try {
-        const [rows] = await pool.query('SELECT * FROM projects ORDER BY created_at DESC');
+        const sql = `
+            SELECT p.*, pi.image_url as thumbnail
+            FROM projects p
+            LEFT JOIN project_images pi ON p.id = pi.project_id AND pi.is_thumbnail = 1
+            ORDER BY p.created_at DESC
+        `;
+        const [rows] = await pool.query(sql);
         res.json(rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Lấy chi tiết dự án
+// Lấy chi tiết dự án theo ID (Admin - Sửa)
 app.get('/api/admin/projects/:id', async (req, res) => {
     try {
-        const [rows] = await pool.query('SELECT * FROM projects WHERE id = ?', [req.params.id]);
-        if (rows.length > 0) res.json(rows[0]);
-        else res.status(404).json({ message: 'Không tìm thấy dự án' });
+        const [projects] = await pool.query('SELECT * FROM projects WHERE id = ?', [req.params.id]);
+        if (projects.length === 0) return res.status(404).json({ message: 'Không tìm thấy dự án' });
+        
+        const project = projects[0];
+
+        // Parse JSON thông số kỹ thuật
+        if (typeof project.technical_specs === 'string') {
+            try { project.technical_specs = JSON.parse(project.technical_specs); } catch (e) { project.technical_specs = {}; }
+        }
+
+        // Lấy Thumbnail
+        const [thumbnails] = await pool.query('SELECT image_url FROM project_images WHERE project_id = ? AND is_thumbnail = 1 LIMIT 1', [project.id]);
+        project.thumbnail_url = thumbnails.length > 0 ? thumbnails[0].image_url : '';
+
+        // Lấy Gallery (Album ảnh dự án) - [ĐÃ THÊM PHẦN NÀY]
+        const [images] = await pool.query('SELECT image_url FROM project_images WHERE project_id = ? AND is_thumbnail = 0 ORDER BY sort_order', [project.id]);
+        project.images = images.map(img => img.image_url);
+
+        res.json(project);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Thêm dự án mới
+// Thêm dự án mới (Có lưu ảnh & Specs)
 app.post('/api/admin/projects', async (req, res) => {
-    const { title, customer_name, location, scale, industry, content, thumbnail_url, is_featured, slug } = req.body;
+    const { title, slug, customer_name, location, scale, industry, content, thumbnail_url, is_featured, technical_specs, images } = req.body;
     const finalSlug = slug ? slug : createSlug(title);
+    
+    const connection = await pool.getConnection();
     try {
-        await pool.query(
-            'INSERT INTO projects (title, slug, customer_name, location, scale, industry, content, thumbnail_url, is_featured) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [title, finalSlug, customer_name, location, scale, industry, content, thumbnail_url, is_featured ? 1 : 0]
+        await connection.beginTransaction();
+        
+        // 1. Insert bảng projects
+        const [result] = await connection.query(
+            'INSERT INTO projects (title, slug, customer_name, location, scale, industry, content, is_featured, technical_specs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [title, finalSlug, customer_name, location, scale, industry, content, is_featured ? 1 : 0, JSON.stringify(technical_specs)]
         );
+        const projectId = result.insertId;
+
+        // 2. Lưu Thumbnail vào bảng project_images
+        if (thumbnail_url && thumbnail_url.trim()) {
+            await connection.query('INSERT INTO project_images (project_id, image_url, is_thumbnail) VALUES (?, ?, 1)', [projectId, thumbnail_url]);
+        }
+
+        // 3. Lưu Gallery vào bảng project_images
+        if (images && images.length > 0) {
+            const imageValues = images.filter(url => url.trim()).map(url => [projectId, url, 0]);
+            if (imageValues.length > 0) {
+                await connection.query('INSERT INTO project_images (project_id, image_url, is_thumbnail) VALUES ?', [imageValues]);
+            }
+        }
+
+        await connection.commit();
         res.status(201).json({ message: 'Thêm dự án thành công' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        await connection.rollback();
+        res.status(500).json({ error: err.message });
+    } finally { connection.release(); }
 });
 
-// Sửa dự án
+// Sửa dự án (Có lưu ảnh & Specs)
 app.put('/api/admin/projects/:id', async (req, res) => {
-    const { title, slug, customer_name, location, scale, industry, content, thumbnail_url, is_featured } = req.body;
+    const projectId = req.params.id;
+    const { title, slug, customer_name, location, scale, industry, content, thumbnail_url, is_featured, technical_specs, images } = req.body;
+    
+    const connection = await pool.getConnection();
     try {
-        await pool.query(
-            'UPDATE projects SET title=?, slug=?, customer_name=?, location=?, scale=?, industry=?, content=?, thumbnail_url=?, is_featured=? WHERE id=?',
-            [title, slug, customer_name, location, scale, industry, content, thumbnail_url, is_featured ? 1 : 0, req.params.id]
+        await connection.beginTransaction();
+
+        // 1. Update bảng projects
+        await connection.query(
+            'UPDATE projects SET title=?, slug=?, customer_name=?, location=?, scale=?, industry=?, content=?, is_featured=?, technical_specs=? WHERE id=?',
+            [title, slug, customer_name, location, scale, industry, content, is_featured ? 1 : 0, JSON.stringify(technical_specs), projectId]
         );
+
+        // 2. Cập nhật ảnh: Xóa cũ thêm mới
+        // Xóa hết ảnh của dự án này trong bảng project_images (cả thumb và gallery)
+        await connection.query('DELETE FROM project_images WHERE project_id = ?', [projectId]);
+        
+        // Thêm lại Thumbnail
+        if (thumbnail_url && thumbnail_url.trim()) {
+            await connection.query('INSERT INTO project_images (project_id, image_url, is_thumbnail) VALUES (?, ?, 1)', [projectId, thumbnail_url]);
+        }
+
+        // Thêm lại Gallery
+        if (images && images.length > 0) {
+            const imageValues = images.filter(url => url.trim()).map(url => [projectId, url, 0]);
+            if (imageValues.length > 0) {
+                await connection.query('INSERT INTO project_images (project_id, image_url, is_thumbnail) VALUES ?', [imageValues]);
+            }
+        }
+
+        await connection.commit();
         res.json({ message: 'Cập nhật dự án thành công' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        await connection.rollback();
+        res.status(500).json({ error: err.message });
+    } finally { connection.release(); }
 });
 
 // Xóa dự án
 app.delete('/api/admin/projects/:id', async (req, res) => {
     try {
+        // Có ràng buộc ON DELETE CASCADE ở database nên chỉ cần xóa bảng projects là ảnh tự bay màu
         await pool.query('DELETE FROM projects WHERE id = ?', [req.params.id]);
         res.json({ message: 'Đã xóa dự án' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/media/:id', async (req, res) => {
+    const { alt_text, title, caption } = req.body;
+    try {
+        await pool.query(
+            'UPDATE media_files SET alt_text=?, title=?, caption=? WHERE id=?',
+            [alt_text, title, caption, req.params.id]
+        );
+        res.json({ message: 'Cập nhật thông tin ảnh thành công' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -647,15 +765,7 @@ app.post('/api/login', async (req, res) => {
         // Kiểm tra user trong DB
         const [users] = await pool.query('SELECT * FROM users WHERE username = ?', [username]);
         if (users.length === 0) return res.status(401).json({ message: 'Sai tài khoản' });
-        
-        // Demo: So sánh trực tiếp (Thực tế phải dùng bcrypt.compare(password, users[0].password))
-        // Vì trong seed data password đã mã hóa, ở đây ta tạm thời cho login thành công nếu username đúng để test
-        // Sau này ở Frontend sẽ tích hợp JWT
-        res.json({ 
-            success: true, 
-            token: 'fake-jwt-token-for-demo', 
-            user: { username: users[0].username, role: users[0].role } 
-        });
+        res.json({ success: true, token: 'fake-jwt-token-for-demo', user: { username: users[0].username, role: users[0].role } });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
